@@ -54,14 +54,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: src-tauri }
       - run: npm ci
+      # macOS signing + notarization, only when the Apple secrets exist (otherwise the build stays unsigned).
+      # Tauri imports APPLE_CERTIFICATE into a temporary keychain, signs with APPLE_SIGNING_IDENTITY
+      # and notarizes with the App Store Connect API key.
+      - if: runner.os == 'macOS'
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -z "$CERT" ]; then echo "No Apple secrets: building unsigned."; exit 0; fi
+          printf '%s' "$API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          {
+            echo "APPLE_CERTIFICATE=$CERT"
+            echo "APPLE_CERTIFICATE_PASSWORD=$CERT_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$IDENTITY"
+            echo "APPLE_API_ISSUER=$API_ISSUER"
+            echo "APPLE_API_KEY=$API_KEY_ID"
+            echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8"
+          } >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: SpoolTap ${{ github.ref_name }}
-          releaseBody: |
-            Builds for macOS (universal), Windows and Linux.
-            macOS builds are not notarized: open the app once with right-click → Open.
+          releaseBody: Builds for macOS (universal, signed and notarized), Windows and Linux.
           releaseDraft: true
           args: ${{ matrix.args }}

@@ -21,6 +21,12 @@ Built with Rust and [Tauri 2](https://tauri.app); runs on macOS, Windows and Lin
 - **Delete** – wipe a tag and unlink it, optionally marking the spool empty and archived.
 - **Spoolman update check** in the tray menu and settings.
 
+## Download
+
+Installers for macOS (Apple Silicon + Intel), Windows and Linux are on the
+[Releases](https://github.com/BNoiZe/SpoolTap/releases) page. The macOS app is not notarized:
+open it the first time with right-click → *Open*.
+
 ## Requirements
 
 - Spoolman **0.27 or newer** (tag scanning API).
@@ -41,6 +47,9 @@ The bundle ends up in `src-tauri/target/release/bundle/`. Build on the platform 
 Linux additionally needs `libpcsclite-dev`, `libwebkit2gtk-4.1-dev` and `libayatana-appindicator3-dev`.
 
 Run the tests with `cargo test` in `src-tauri/`.
+
+Pushing a version tag (`git tag v1.2.3 && git push --tags`) builds all platforms in GitHub Actions
+and uploads them to a draft release.
 
 ## Notes
 

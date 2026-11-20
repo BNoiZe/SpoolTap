@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpoolTap</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="root" style="height:100%"></div>
+<script>
+const { invoke } = window.__TAURI__.core;
+
+// ---------- helpers ----------
+
+/** Tiny DOM builder: el('div', {class: 'x', onclick}, 'text', child). Text is never parsed as HTML. */
+function el(tag, attrs = {}, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k.startsWith('on')) n[k] = v;
+    else if (k === 'class') n.className = v;
+    else n.setAttribute(k, v === true ? '' : v);
+  }
+  n.append(...children.flat().filter((c) => c != null && c !== false));
+  return n;
+}
+const swatch = (hex, big) => el('div', { class: big ? 'swatch big' : 'swatch', style: /^[0-9a-f]{6}/i.test(hex || '') ? `background:#${hex.slice(0, 6)}` : null });
+const spinner = () => el('div', { class: 'spinner' });
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+const api = (method, path, { query, body } = {}) => invoke('api', { method, path, query: query ?? null, body: body ?? null });
+const apiMessage = (r) => r.json?.message ?? (r.json?.detail ? JSON.stringify(r.json.detail) : `HTTP ${r.code}`);
+const pad6 = (n) => String(n).padStart(6, '0');
+const ICONS = {
+  weigh: '<path d="M4 20h16l-2-10H6z"/><path d="M9 10a3 3 0 0 1 6 0"/><circle cx="12" cy="5" r="1.5"/>',
+  add: '<path d="M3 7.5V3h4.5l9 9-4.5 4.5z"/><circle cx="6" cy="6" r="1"/><path d="M18 15v6M15 18h6"/>',
+  cfs: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/>',
+  refresh: '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
+  tag: '<path d="M3 7.5V3h4.5l9 9-4.5 4.5z"/><circle cx="6" cy="6" r="1"/>',
+};
+/** Line icon as an <svg> element; markup comes only from the static ICONS table. */
+function icon(name, cls = 'icon') {
+  const t = document.createElement('template');
+  t.innerHTML = `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+  return t.content.firstChild;
+}
+
+// Fit the window to the content (+ body padding). The webview can end up smaller than the size asked for
+// (on macOS the title bar comes out of it), so after each resize the actual viewport is compared with
+// what is needed and the difference is asked for once more.
+let fitTarget = 0, fitSent = 0, fitTries = 0;
+const fit = () => requestAnimationFrame(() => {
+  fitTarget = Math.ceil(document.getElementById('root').firstElementChild.getBoundingClientRect().height) + 2 * parseFloat(getComputedStyle(document.body).paddingTop);
+  fitSent = fitTarget; fitTries = 0;
+  invoke('fit_panel', { width: window.innerWidth, height: fitSent });
+});
+window.addEventListener('resize', () => {
+  const missing = fitTarget - window.innerHeight;
+  if (!fitTarget || Math.abs(missing) <= 1 || fitTries >= 3) return;
+  fitTries++; fitSent += missing;
+  invoke('fit_panel', { width: window.innerWidth, height: fitSent });
+});
+
+/** Spoolman spool JSON -> what the UI shows. */
+function spoolRow(s) {
+  const f = s.filament || {};
+  const vendor = f.vendor?.name || '';
+  const title = [vendor, f.name].filter(Boolean).join(' ') || `Spule #${s.id}`;
+  const remaining = s.remaining_weight != null ? `${Math.trunc(s.remaining_weight)} g` : null;
+  return {
+    raw: s, id: s.id, title, color: f.color_hex,
+    detail: [`#${s.id}`, f.material, remaining, s.location].filter(Boolean).join(' · '),
+    vendor, name: f.name || '', material: f.material || '',
+    weight: s.initial_weight ?? f.weight ?? 1000,
+    remaining: s.remaining_weight ?? null,
+    location: s.location || '',
+    // empty-spool weight in the order Spoolman's /measure resolves it
+    tare: s.spool_weight ?? f.spool_weight ?? f.vendor?.empty_spool_weight ?? null,
+    tags: (s.tags || []).map((t) => t.uid),
+  };
+}
+
+/** A filament to create a spool from: local (Spoolman) or SpoolmanDB catalog entry. */
+function localFilament(f) {
+  return { key: `l${f.id}`, localId: f.id, vendor: f.vendor?.name || '', name: f.name || `Filament #${f.id}`,
+           material: f.material || '', color: f.color_hex, weight: f.weight, externalId: f.external_id };
+}
+function externalFilament(f) {
+  return { key: `e${f.id}`, external: f, vendor: f.manufacturer || '', name: f.name || f.id, material: f.material || '',
+           color: (f.color_hex || f.color_hexes?.[0] || '').replace('#', ''), weight: f.weight };
+}
+const filTitle = (f) => `${f.vendor} ${f.name}`.trim();
+const filDetail = (f) => [f.material, f.weight != null ? `${Math.trunc(f.weight)} g` : null, f.localId ? `#${f.localId}` : 'SpoolmanDB'].filter(Boolean).join(' · ');
+
+/** Body for POST /filament from a SpoolmanDB entry (same mapping as Spoolman's own client). */
+function filamentBody(ext, vendorId) {
+  const b = { vendor_id: vendorId };
+  const map = { name: 'name', material: 'material', density: 'density', diameter: 'diameter', weight: 'weight',
+                spool_weight: 'spool_weight', id: 'external_id', extruder_temp: 'settings_extruder_temp', bed_temp: 'settings_bed_temp' };
+  for (const [from, to] of Object.entries(map)) if (ext[from] != null) b[to] = ext[from];
+  const strip = (h) => h.replace(/^#/, '');
+  if (ext.color_hexes?.length) {
+    b.multi_color_hexes = ext.color_hexes.map(strip).join(',');
+    if (ext.multi_color_direction) b.multi_color_direction = ext.multi_color_direction;
+  } else if (ext.color_hex) b.color_hex = strip(ext.color_hex);
+  return b;
+}
+
+function materialSelect(materials, value, onchange) {
+  const s = el('select', { onchange: (e) => onchange(e.target.value) }, materials.map((m) => new Option(m.name, m.id)));
+  s.value = value;
+  return s;
+}
+
+// ---------- info view ----------
+
+async function infoView(panel, materials) {
+  const uid = panel.uid, classic = uid.length === 8;
+  let sp = spoolRow(panel.spool);
+  let cfs = { state: 'loading' }, materialId = await invoke('cfs_suggest', { vendor: sp.vendor, name: sp.name, material: sp.material });
+  let busy = false, error = null, editing = false, confirming = false, emptySpool = false;
+  // weighing: gross weight on the scale, tare only asked for when Spoolman knows none
+  let weighing = false, gross = '', tareInput = '', updateTagLength = true;
+  // copy mode: the next new tag joins this spool with the same CFS record (handled by the backend)
+  let copying = false, copyError = null;
+  window.__TAURI__.event.listen('copy-status', (e) => { copyError = e.payload.error; render(); });
+
+  const startCopy = () => {
+    copying = true; copyError = null; editing = weighing = confirming = false;
+    const c = cfs.state === 'data' ? { material_id: cfs.info.material_id, color_hex: cfs.info.color_hex, meters: cfs.info.meters } : null;
+    invoke('arm_copy', { spoolId: sp.id, sourceUid: uid, cfs: c });
+    render();
+  };
+  const stopCopy = () => { copying = false; copyError = null; invoke('disarm_copy'); render(); };
+  const root = document.getElementById('root');
+
+  const setBusy = (b) => { busy = b; invoke('set_panel_busy', { busy: b }); render(); };
+  const run = async (fn) => { error = null; setBusy(true); try { await fn(); } catch (e) { error = String(e); } setBusy(false); };
+
+  async function readCfs() {
+    if (!classic) { cfs = { state: 'none' }; return; }
+    try {
+      const info = await invoke('cfs_read', { uid });
+      cfs = info ? { state: 'data', info } : { state: 'none' };
+      if (info) materialId = info.material_id; // keep what's on the tag unless changed
+    } catch (e) { cfs = { state: 'error', msg: String(e) }; }
+  }
+
+  const writeCfs = () => run(async () => {
+    await invoke('cfs_write', { uid, materialId, colorHex: sp.color || 'FFFFFF', weight: sp.weight, serial: sp.id });
+    await readCfs();
+    editing = false;
+    invoke('set_status_text', { text: `CFS-Daten auf Tag ${uid} geschrieben` });
+  });
+
+  const num = (v) => { const n = parseFloat(String(v).replace(',', '.')); return Number.isFinite(n) ? n : null; };
+  const tare = () => sp.tare ?? num(tareInput);
+  const netPreview = () => (num(gross) != null && tare() != null ? Math.max(0, num(gross) - tare()) : null);
+  const tagHasCfs = () => classic && cfs.state === 'data';
+
+  const saveWeight = () => run(async () => {
+    const g = num(gross);
+    if (g == null || g <= 0) throw 'Bruttogewicht eingeben (Spule + Filament, in g).';
+    if (sp.tare == null) {
+      const t = num(tareInput);
+      if (t == null || t < 0) throw 'Leergewicht der Spule eingeben – Spoolman kennt es für diese Spule nicht.';
+      const p = await api('PATCH', `/spool/${sp.id}`, { body: { spool_weight: t } });
+      if (p.code !== 200) throw `Leergewicht nicht gespeichert: ${apiMessage(p)}`;
+    }
+    const r = await api('PUT', `/spool/${sp.id}/measure`, { body: { weight: g } });
+    if (r.code !== 200 || !r.json?.id) throw `Gewicht nicht gespeichert: ${apiMessage(r)}`;
+    sp = spoolRow({ ...r.json, tags: r.json.tags ?? panel.spool.tags });
+    let note = `Spule #${sp.id}: ${Math.trunc(sp.remaining ?? 0)} g übrig`;
+    if (tagHasCfs() && updateTagLength) {
+      // the CFS reads its remaining length from the tag; keep the material that is on it
+      await invoke('cfs_write', { uid, materialId: cfs.info.material_id, colorHex: cfs.info.color_hex, weight: sp.remaining ?? 0, serial: sp.id });
+      await readCfs();
+      note += ', CFS-Länge aktualisiert';
+    }
+    weighing = false; gross = ''; tareInput = '';
+    invoke('set_status_text', { text: note });
+  });
+
+  /** Wipe (MIFARE Classic) and unlink the tag; with `empty` also mark the spool used up: 0 g left, archived. */
+  const deleteTag = (empty) => run(async () => {
+    confirming = false;
+    if (classic) { await invoke('cfs_wipe', { uid }); cfs = { state: 'none' }; }
+    const r = await api('DELETE', `/spool/${sp.id}/tag/${uid}`);
+    if (![200, 204, 404].includes(r.code)) throw `Verknüpfung nicht entfernt: ${apiMessage(r)}`;
+    if (empty) {
+      const p = await api('PATCH', `/spool/${sp.id}`, { body: { remaining_weight: 0, archived: true } });
+      if (p.code !== 200) throw `Tag entfernt, aber Spule #${sp.id} nicht geleert: ${apiMessage(p)}`;
+    }
+    invoke('set_status_text', { text: `Tag ${uid} entfernt${empty ? `, Spule #${sp.id} leer & archiviert` : ''}` });
+    invoke('close_panel');
+  });
+
+  function cfsCell() {
+    switch (cfs.state) {
+      case 'loading': return el('div', { class: 'row muted' }, spinner(), 'Tag wird gelesen…');
+      case 'none': return el('div', { class: 'muted' }, 'Keine Creality-Daten');
+      case 'error': return el('div', { class: 'red' }, cfs.msg);
+      default: {
+        const d = cfs.info;
+        return el('div', {},
+          el('div', { class: 'row', style: 'gap:6px' }, swatch(d.color_hex), d.material),
+          el('div', { class: 'small muted' }, `#${d.color_hex} · ${d.meters} m · Seriennr. ${pad6(d.serial)}`),
+          d.serial !== sp.id && el('div', { class: 'small orange' }, `Seriennummer gehört nicht zu Spule #${sp.id}`));
+      }
+    }
+  }
+
+  // ---- task groups (one at a time, each with its own Cancel / confirm) ----
+  const cancel = () => { weighing = editing = confirming = false; error = null; render(); };
+  const groupButtons = (...buttons) => el('div', { class: 'row' }, el('span', { class: 'spacer' }),
+    el('button', { onclick: cancel }, 'Abbrechen'), ...buttons);
+
+  function weighGroup() {
+    const input = (id, value, placeholder, oninput) => el('input', { id, type: 'text', inputmode: 'decimal', placeholder, value, style: 'width:80px', oninput });
+    const preview = el('div', {});
+    const updatePreview = () => {
+      const n = netPreview();
+      preview.replaceChildren(n == null ? el('span', { class: 'muted' }, 'Gewicht eingeben')
+        : el('span', {}, `${Math.round(n)} g Filament`,
+          sp.remaining != null && el('span', { class: 'muted' }, ` · bisher ${Math.trunc(sp.remaining)} g`),
+          tagHasCfs() && updateTagLength && el('span', { class: 'muted' }, ` · CFS ${Math.trunc(n / 1000 * 330)} m`)));
+    };
+    const grossField = input('gross', gross, '1034', (e) => { gross = e.target.value; updatePreview(); });
+    const g = el('div', { class: 'group' },
+      el('div', { class: 'group-title' }, 'Spule wiegen'),
+      el('div', { class: 'form', style: 'align-items:center' },
+        el('label', { class: 'label', for: 'gross' }, 'Gewicht auf der Waage:'),
+        el('div', { class: 'row' }, grossField, el('span', { class: 'muted' }, 'g')),
+        el('label', { class: 'label', for: 'tare' }, 'Leerspule:'),
+        sp.tare != null
+          ? el('div', { class: 'muted' }, `${Math.round(sp.tare)} g`)
+          : el('div', { class: 'row' }, input('tare', tareInput, '200', (e) => { tareInput = e.target.value; updatePreview(); }),
+              el('span', { class: 'muted' }, 'g · wird gespeichert')),
+        el('span', { class: 'label' }, 'Ergebnis:'), preview),
+      tagHasCfs() && el('label', { class: 'row' },
+        el('input', { type: 'checkbox', checked: updateTagLength, onchange: (e) => { updateTagLength = e.target.checked; updatePreview(); } }),
+        'CFS-Länge auf dem Tag anpassen'),
+      groupButtons(el('button', { class: 'primary', disabled: busy, onclick: saveWeight }, 'Sichern')));
+    updatePreview();
+    return g;
+  }
+
+  const copyGroup = () => el('div', { class: 'group' },
+    el('div', { class: 'row' }, spinner(), el('span', { class: 'group-title' }, 'Neuen Tag auflegen')),
+    el('div', { class: 'muted' }, `Diesen Tag abnehmen und einen leeren Tag auflegen. Er wird mit Spule #${sp.id} verknüpft`,
+      cfs.state === 'data' ? ` und erhält dieselben CFS-Daten (${cfs.info.material}, ${cfs.info.meters} m).` : '.'),
+    copyError && el('div', { class: 'red sel' }, copyError),
+    el('div', { class: 'row' }, el('span', { class: 'spacer' }), el('button', { onclick: stopCopy }, 'Abbrechen')));
+
+  const cfsGroup = () => el('div', { class: 'group' },
+    el('div', { class: 'group-title' }, 'CFS-Daten schreiben'),
+    el('div', { class: 'form', style: 'align-items:center' },
+      el('label', { class: 'label' }, 'Material:'), materialSelect(materials, materialId, (v) => { materialId = v; }),
+      el('span', { class: 'label' }, 'Farbe:'), el('div', { class: 'row', style: 'gap:6px' }, swatch(sp.color), `#${(sp.color || 'FFFFFF').toUpperCase()}`),
+      el('span', { class: 'label' }, 'Länge:'), el('div', {}, `${Math.trunc(sp.weight / 1000 * 330)} m (${Math.trunc(sp.weight)} g)`)),
+    groupButtons(el('button', { class: 'primary', disabled: busy, onclick: writeCfs }, 'Schreiben')));
+
+  const deleteGroup = () => el('div', { class: 'group' },
+    el('div', { class: 'group-title' }, classic ? 'Tag löschen?' : 'Verknüpfung lösen?'),
+    el('div', { class: 'muted' }, classic
+      ? `Die Daten auf dem Tag werden gelöscht und der Tag wird von Spule #${sp.id} getrennt. Das kann nicht widerrufen werden.`
+      : `Der Tag wird von Spule #${sp.id} getrennt.`),
+    el('label', { class: 'row' },
+      el('input', { type: 'checkbox', checked: emptySpool, onchange: (e) => { emptySpool = e.target.checked; } }),
+      'Spule ist aufgebraucht (0 g, archivieren)'),
+    groupButtons(el('button', { class: 'danger', disabled: busy, onclick: () => deleteTag(emptySpool) }, classic ? 'Löschen' : 'Lösen')));
+
+  /** Toolbar item: line icon above a short label, like a macOS window toolbar. */
+  const tool = (name, label, onclick, { disabled = false, danger = false, title } = {}) => {
+    return el('button', { class: danger ? 'tool danger' : 'tool', disabled: busy || disabled, onclick, title }, icon(name), el('span', {}, label));
+  };
+
+  function render() {
+    const others = sp.tags.filter((t) => t !== uid);
+    const task = weighing || editing || copying || confirming;
+    const focusedId = document.activeElement?.id;
+    root.replaceChildren(el('div', { class: 'col' },
+      el('div', { class: 'toolbar' },
+        tool('weigh', 'Wiegen', () => { weighing = true; render(); }, { disabled: task, title: 'Restgewicht per Waage aktualisieren' }),
+        tool('add', 'Tag hinzufügen', startCopy, { disabled: task || cfs.state === 'loading', title: 'Weiteren Tag, z. B. für die andere Spulenseite' }),
+        classic && tool('cfs', 'CFS schreiben', () => { editing = true; render(); }, { disabled: task, title: 'Material, Farbe und Länge auf den Tag schreiben' }),
+        tool('trash', classic ? 'Löschen' : 'Lösen', () => { confirming = true; render(); }, { disabled: task, danger: true, title: classic ? 'Tag leeren und von der Spule trennen' : 'Tag von der Spule trennen' })),
+      el('div', { class: 'row', style: 'gap:12px' }, swatch(sp.color, true),
+        el('div', {}, el('h1', {}, sp.title), el('div', { class: 'muted' }, `Spule #${sp.id}`))),
+      el('div', { class: 'form' },
+        el('span', { class: 'label' }, 'Material:'), el('div', {}, sp.material || '–'),
+        el('span', { class: 'label' }, 'Restgewicht:'), el('div', {},
+          sp.remaining != null ? `${Math.trunc(sp.remaining)} g` : '–',
+          el('span', { class: 'muted' }, ` von ${Math.trunc(sp.weight)} g`)),
+        sp.location && el('span', { class: 'label' }, 'Lagerort:'), sp.location && el('div', {}, sp.location),
+        el('span', { class: 'label' }, 'Tag:'), el('div', { class: 'sel' }, uid, el('span', { class: 'muted' }, classic ? ' · MIFARE Classic' : ' · NTAG')),
+        el('span', { class: 'label' }, 'Weitere Tags:'), el('div', { class: others.length ? 'sel' : 'muted' }, others.length ? others.join(', ') : 'keine'),
+        el('span', { class: 'label' }, 'CFS:'), cfsCell()),
+      weighing && weighGroup(),
+      copying && copyGroup(),
+      editing && cfsGroup(),
+      confirming && deleteGroup(),
+      error && el('div', { class: 'red sel' }, error),
+      el('div', { class: 'row', style: 'margin-top:4px' },
+        el('span', { class: 'spacer' }),
+        busy && spinner(),
+        el('button', { onclick: () => invoke('close_panel') }, 'Schließen'),
+        el('button', { class: 'primary', disabled: !!task, onclick: () => { invoke('close_panel'); invoke('open_spoolman', { path: `/spool/show/${sp.id}` }); } }, 'In Spoolman öffnen'))));
+    const refocus = document.getElementById(focusedId) || (weighing && document.getElementById('gross'));
+    if (refocus && document.activeElement !== refocus) { refocus.focus(); refocus.setSelectionRange?.(refocus.value.length, refocus.value.length); }
+    fit();
+  }
+
+  document.onkeydown = (e) => {
+    if (e.key === 'Escape') { if (copying) return stopCopy(); if (weighing || editing || confirming) return cancel(); invoke('close_panel'); }
+    if (copying) return;
+    if (e.key === 'Enter' && weighing) { e.preventDefault(); saveWeight(); return; }
+    if (e.key === 'Enter' && !editing && !confirming) { invoke('close_panel'); invoke('open_spoolman', { path: `/spool/show/${sp.id}` }); }
+  };
+  render();
+  await readCfs();
+  render();
+}
+
+// ---------- link view ----------
+
+async function linkView(panel, materials) {
+  const uid = panel.uid, cfsPossible = uid.length === 8;
+  const s = {
+    mode: store.get('linkMode') === 'existing' ? 'existing' : 'new',
+    spools: [], query: '', selection: null,
+    filQuery: '', localFils: [], externalFils: [], filSelection: null,
+    created: null, // {key, spool}: a retry after a failed link must not create a 2nd spool
+    busy: false, error: null,
+    writeCfs: cfsPossible && store.get('writeCFS') === '1', materialId: '00001',
+  };
+  const root = document.getElementById('root');
+  let searchTimer = null, searchSeq = 0, listEl = null;
+
+  const filteredSpools = () => {
+    const q = s.query.trim().toLowerCase();
+    return q ? s.spools.filter((r) => `${r.title} ${r.detail}`.toLowerCase().includes(q)) : s.spools;
+  };
+  const filteredLocal = () => {
+    const words = s.filQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    return s.localFils.filter((f) => words.every((w) => `${filTitle(f)} ${f.material}`.toLowerCase().includes(w)));
+  };
+  const selectedFil = () => [...s.localFils, ...s.externalFils].find((f) => f.key === s.filSelection);
+  const canSubmit = () => !s.busy && (s.mode === 'existing' ? s.selection != null : s.filSelection != null);
+
+  async function updateMaterial() {
+    const src = s.mode === 'existing' ? s.spools.find((r) => r.id === s.selection) : selectedFil();
+    if (src) s.materialId = await invoke('cfs_suggest', { vendor: src.vendor, name: src.name, material: src.material });
+  }
+
+  async function refresh() {
+    s.busy = true; render();
+    try {
+      const [sp, fi] = await Promise.all([api('GET', '/spool'), api('GET', '/filament')]);
+      s.spools = (Array.isArray(sp.json) ? sp.json : []).map(spoolRow).sort((a, b) => b.id - a.id);
+      s.localFils = (Array.isArray(fi.json) ? fi.json : []).map(localFilament).sort((a, b) => filTitle(a).localeCompare(filTitle(b)));
+    } catch (e) { s.error = String(e); }
+    s.busy = false; render();
+  }
+
+  function searchCatalog() {
+    clearTimeout(searchTimer);
+    const q = s.filQuery.trim(), seq = ++searchSeq;
+    if (q.length < 2) { s.externalFils = []; return renderList(); }
+    searchTimer = setTimeout(async () => { // debounce while typing
+      const r = await api('GET', '/external/filament/search', { query: { query: q, limit: '50' } }).catch(() => null);
+      if (!r || seq !== searchSeq) return;
+      const imported = new Set(s.localFils.map((f) => f.externalId).filter(Boolean)); // shown under "Meine Filamente"
+      s.externalFils = (Array.isArray(r.json) ? r.json : []).map(externalFilament).filter((f) => !imported.has(f.external.id));
+      renderList();
+    }, 300);
+  }
+
+  /** Local filament id, importing a SpoolmanDB entry (and its vendor) the way Spoolman's client does. */
+  async function localFilamentId(f) {
+    if (f.localId) return f.localId;
+    const q = (v) => `"${v}"`;
+    const hit = (await api('GET', '/filament', { query: { external_id: q(f.external.id) } })).json?.[0];
+    if (hit?.id) return hit.id;
+    let vendorId = (await api('GET', '/vendor', { query: { external_id: q(f.vendor) } })).json?.[0]?.id;
+    if (!vendorId) {
+      const all = (await api('GET', '/vendor')).json || [];
+      vendorId = all.find((v) => (v.name || '').toLowerCase() === f.vendor.toLowerCase())?.id;
+    }
+    if (!vendorId) {
+      const r = await api('POST', '/vendor', { body: { name: f.vendor, external_id: f.vendor } });
+      if (!r.json?.id) throw `Hersteller nicht angelegt: ${apiMessage(r)}`;
+      vendorId = r.json.id;
+    }
+    const r = await api('POST', '/filament', { body: filamentBody(f.external, vendorId) });
+    if (!r.json?.id) throw `Filament nicht angelegt: ${apiMessage(r)}`;
+    s.localFils.push(localFilament(r.json));
+    return r.json.id;
+  }
+
+  async function createSpool() {
+    const f = selectedFil();
+    if (s.created?.key === f.key) return s.created.spool;
+    const filamentId = await localFilamentId(f);
+    const r = await api('POST', '/spool', { body: { filament_id: filamentId } });
+    if (![200, 201].includes(r.code) || !r.json?.id) throw `Spule nicht angelegt: ${apiMessage(r)}`;
+    s.created = { key: f.key, spool: r.json };
+    return r.json;
+  }
+
+  async function submit() {
+    if (!canSubmit()) return;
+    s.busy = true; s.error = null; invoke('set_panel_busy', { busy: true }); render();
+    try {
+      const spool = s.mode === 'existing' ? s.spools.find((r) => r.id === s.selection).raw : await createSpool();
+      const row = spoolRow(spool);
+      if (s.writeCfs) {
+        await invoke('cfs_write', { uid, materialId: s.materialId, colorHex: row.color || 'FFFFFF', weight: row.weight, serial: row.id });
+      }
+      const r = await api('POST', `/spool/${row.id}/tag`, { body: { uid } });
+      if (r.code === 409) {
+        const holder = r.json?.spool_id ? `Spule #${r.json.spool_id}` : r.json?.filament_id ? `Filament #${r.json.filament_id}` : 'etwas anderem';
+        throw `Tag ist schon mit ${holder} verknüpft.`;
+      }
+      if (![200, 201].includes(r.code)) throw `Fehler beim Verknüpfen: ${apiMessage(r)}`;
+      const tags = [...(spool.tags || [])];
+      if (!tags.some((t) => t.uid === uid)) tags.push({ uid });
+      await invoke('show_info', { uid, spool: { ...spool, tags } }); // reads the tag back
+      return;
+    } catch (e) { s.error = String(e); }
+    s.busy = false; invoke('set_panel_busy', { busy: false }); render();
+  }
+
+  function item(key, selected, swatchHex, title, detail, badge, onselect) {
+    return el('div', { class: selected ? 'item selected' : 'item', 'data-key': key, onclick: onselect, ondblclick: () => { onselect(); submit(); } },
+      swatch(swatchHex), el('div', { class: 't' }, el('div', {}, title), el('div', { class: 'small muted' }, detail)),
+      badge > 0 && el('span', { class: 'badge', title: `${badge} Tag${badge === 1 ? '' : 's'} verknüpft` }, icon('tag'), String(badge)));
+  }
+
+  const select = (key) => {
+    if (s.mode === 'existing') s.selection = key; else s.filSelection = key;
+    updateMaterial().then(render);
+    render();
+  };
+
+  function renderList() {
+    if (!listEl) return;
+    const rows = [];
+    if (s.mode === 'existing') {
+      const list = filteredSpools();
+      for (const r of list) rows.push(item(r.id, r.id === s.selection, r.color, r.title, r.detail, r.tags.length, () => select(r.id)));
+      if (!list.length) rows.push(el('div', { class: 'empty' }, s.busy ? 'Lade…' : 'Keine Spule gefunden'));
+    } else {
+      const local = filteredLocal();
+      if (local.length) rows.push(el('div', { class: 'section' }, 'Meine Filamente'));
+      for (const f of local) rows.push(item(f.key, f.key === s.filSelection, f.color, filTitle(f), filDetail(f), 0, () => select(f.key)));
+      if (s.externalFils.length) rows.push(el('div', { class: 'section' }, 'SpoolmanDB'));
+      for (const f of s.externalFils) rows.push(item(f.key, f.key === s.filSelection, f.color, filTitle(f), filDetail(f), 0, () => select(f.key)));
+      if (!rows.length) rows.push(el('div', { class: 'empty' }, s.filQuery.trim().length < 2 ? 'Suchbegriff eingeben' : 'Kein Filament gefunden'));
+    }
+    const top = listEl.scrollTop;
+    listEl.replaceChildren(...rows);
+    listEl.scrollTop = top;
+  }
+
+  function moveSelection(delta) {
+    const keys = s.mode === 'existing' ? filteredSpools().map((r) => r.id) : [...filteredLocal(), ...s.externalFils].map((f) => f.key);
+    if (!keys.length) return;
+    const cur = keys.indexOf(s.mode === 'existing' ? s.selection : s.filSelection);
+    select(keys[Math.max(0, Math.min(keys.length - 1, cur + delta))]);
+    listEl.querySelector('.item.selected')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function setMode(mode) {
+    s.mode = mode; s.error = null; store.set('linkMode', mode); updateMaterial(); render();
+  }
+
+  function render() {
+    const search = el('input', {
+      type: 'search', spellcheck: 'false', 'aria-label': 'Suchen',
+      placeholder: s.mode === 'new' ? 'Filament suchen' : 'Spule suchen',
+      value: s.mode === 'new' ? s.filQuery : s.query,
+      oninput: (e) => { if (s.mode === 'new') { s.filQuery = e.target.value; searchCatalog(); } else { s.query = e.target.value; } renderList(); },
+    });
+    listEl = el('div', { class: 'list', role: 'listbox' });
+    const chosen = s.mode === 'existing' && s.spools.find((r) => r.id === s.selection);
+    const focused = document.activeElement?.tagName === 'INPUT' && document.activeElement.type === 'search';
+    root.replaceChildren(el('div', { class: 'col', style: 'height: 100%' },
+      el('div', { class: 'toolbar', style: 'justify-content: space-between; align-items: center; padding: 6px 20px 10px' },
+        el('div', { class: 'seg', role: 'tablist', style: 'width: 270px' },
+          el('button', { class: s.mode === 'new' ? 'on' : '', role: 'tab', 'aria-selected': String(s.mode === 'new'), onclick: () => setMode('new') }, 'Neue Spule'),
+          el('button', { class: s.mode === 'existing' ? 'on' : '', role: 'tab', 'aria-selected': String(s.mode === 'existing'), onclick: () => setMode('existing') }, 'Bestehende Spule')),
+        el('label', { class: 'search' }, icon('search'), search)),
+      el('div', { class: 'muted' }, s.mode === 'new'
+        ? `Tag ${uid} ist noch keiner Spule zugeordnet. Filament wählen, um eine neue Spule anzulegen.`
+        : `Tag ${uid} ist noch keiner Spule zugeordnet. Spule wählen, um den Tag zu verknüpfen.`),
+      listEl,
+      chosen && el('div', { class: chosen.tags.length ? 'small orange sel' : 'small muted' }, chosen.tags.length
+        ? `Spule #${chosen.id} hat bereits ${chosen.tags.length} Tag${chosen.tags.length === 1 ? '' : 's'}: ${chosen.tags.join(', ')}`
+        : `Spule #${chosen.id} hat noch keinen Tag.`),
+      el('div', { class: 'row', title: cfsPossible ? 'Schreibt Material, Farbe und Länge im Creality-Format (K2-RFID).' : 'Nur MIFARE-Classic-1K-Tags können CFS-Daten aufnehmen.' },
+        el('label', { class: 'row', style: 'gap:6px; white-space:nowrap' },
+          el('input', { type: 'checkbox', checked: s.writeCfs, disabled: !cfsPossible,
+                        onchange: (e) => { s.writeCfs = e.target.checked; store.set('writeCFS', s.writeCfs ? '1' : '0'); render(); } }),
+          'CFS-Daten auf den Tag schreiben:'),
+        (() => { const m = materialSelect(materials, s.materialId, (v) => { s.materialId = v; }); m.disabled = !s.writeCfs; m.setAttribute('aria-label', 'CFS-Material'); return m; })()),
+      s.error && el('div', { class: 'red sel' }, s.error),
+      el('div', { class: 'row', style: 'margin-top:2px' },
+        el('button', { class: 'icon-btn', disabled: s.busy, onclick: refresh, title: 'Aktualisieren (⌘R)', 'aria-label': 'Aktualisieren' }, icon('refresh')),
+        el('button', { onclick: () => invoke('open_spoolman', { path: '/' }) }, 'In Spoolman öffnen'),
+        el('span', { class: 'spacer' }),
+        s.busy && spinner(),
+        el('button', { onclick: () => invoke('close_panel') }, 'Abbrechen'),
+        el('button', { class: 'primary', disabled: !canSubmit(), onclick: submit }, s.mode === 'new' ? 'Anlegen & verknüpfen' : 'Verknüpfen'))));
+    renderList();
+    if (focused || !render.done) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
+    render.done = true;
+  }
+
+  document.onkeydown = (e) => {
+    if (e.key === 'Escape') invoke('close_panel');
+    else if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
+    else if (e.key === 'r' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); refresh(); }
+  };
+  render();
+  refresh();
+}
+
+// ---------- start ----------
+
+(async () => {
+  const [panel, materials] = await Promise.all([invoke('get_panel'), invoke('cfs_materials')]);
+  if (panel?.kind === 'link') linkView(panel, materials);
+  else if (panel?.kind === 'info') infoView(panel, materials);
+})();
+</script>
+</body>
+</html>

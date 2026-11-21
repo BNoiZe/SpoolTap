@@ -85,3 +85,13 @@ jobs:
           releaseBody: Builds for macOS (universal, signed and notarized), Windows and Linux.
           releaseDraft: true
           args: ${{ matrix.args }}
+      # Tauri notarizes the .app only; notarize and staple the .dmg around it too, then replace it in the release.
+      - if: runner.os == 'macOS' && env.APPLE_API_KEY_PATH != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$dmg"
+          spctl -a -vvv -t open --context context:primary-signature "$dmg"
+          gh release upload "$GITHUB_REF_NAME" "$dmg" --clobber
